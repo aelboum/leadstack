@@ -54,10 +54,10 @@ describe("automations", () => {
 
 describe("date and time display", () => {
   it("always names the time zone, in the requested zone", () => {
-    const text = formatDateTime("2026-10-12T08:00:00Z", "en", "Africa/Casablanca");
+    const text = formatDateTime("2026-10-12T08:00:00Z", "en", "Africa/Lagos");
 
     expect(text).toContain("09:00");
-    expect(text).toMatch(/GMT\+1|WEST|\+01/);
+    expect(text).toMatch(/GMT\+1|WAT|\+01/);
   });
 
   it("keeps Latin digits in Arabic", () => {

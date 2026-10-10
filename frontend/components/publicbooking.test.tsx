@@ -3,15 +3,17 @@ import { groupSlots, isoDay } from "@/components/PublicBooking";
 
 describe("public booking slots", () => {
   it("groups by day in the booking page's time zone, not the visitor's", () => {
-    // 23:30 UTC on the 11th is 00:30 on the 12th in Casablanca (UTC+1).
-    const days = groupSlots(["2026-10-12T08:00:00Z", "2026-10-11T23:30:00Z"], "Africa/Casablanca", "en");
+    // 23:30 UTC on the 11th is 00:30 on the 12th in Lagos (UTC+1 all year).
+    // A zone with stable rules: Morocco's offset changed in 2026, and the
+    // answer for Africa/Casablanca depends on the runtime's tz database.
+    const days = groupSlots(["2026-10-12T08:00:00Z", "2026-10-11T23:30:00Z"], "Africa/Lagos", "en");
 
     expect(days.map((day) => day.key)).toEqual(["2026-10-12"]);
     expect(days[0]?.slots.map((slot) => slot.label)).toEqual(["00:30", "09:00"]);
   });
 
   it("keeps Latin digits and 24-hour times in Arabic", () => {
-    const [day] = groupSlots(["2026-10-12T08:00:00Z"], "Africa/Casablanca", "ar");
+    const [day] = groupSlots(["2026-10-12T08:00:00Z"], "Africa/Lagos", "ar");
 
     expect(day?.slots[0]?.label).toBe("09:00");
     expect(day?.label).toMatch(/12/);

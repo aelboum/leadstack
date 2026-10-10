@@ -376,3 +376,36 @@ Acceptance criteria:
 After that, in order: D14 and hosting, D15, the legal and language
 reviews, D6, and observability. Do not onboard real customers before the
 first five are done.
+
+## 11. Addendum: first commit, push and CI run
+
+Added on 2026-10-10, after the owner authorized a commit and push. Sections
+1 to 10 describe the state before this; where they say "nothing is
+committed" or "CI has never run", this section supersedes them.
+
+- **Commit and push.** The tree was committed as `75ea327` and pushed to
+  `https://github.com/aelboum/leadstack.git` (`main`), which is public. A
+  secrets scan of every file passed immediately before the commit.
+- **First CI run: failed, all five jobs.**
+  - quality, integration, security: the `SAAS_OS_READ_TOKEN` repository
+    secret is not configured, so the pinned dependency cannot be fetched.
+    Expected; only the owner can add it.
+  - deploy: the edge configuration declared the log format twice. Earlier
+    local validation had not caught this. Fixed in `deploy/Caddyfile` and
+    validated with `caddy validate` (exit 0).
+  - frontend: three tests expected Africa/Casablanca to be UTC+1 on
+    2026-10-12. The CI runtime's time zone data says UTC+0; the local
+    Node.js (tz database 2026b) says UTC+1. The tests now use a zone with
+    stable rules (Africa/Lagos) and assert the same behaviour. 37 tests
+    pass locally.
+- **Finding from that failure.** The backend's pinned tz database (2026e)
+  gives UTC+0 for Morocco from late 2026 onward, where older releases give
+  UTC+1. Slots are computed on the server from the pinned data, so stored
+  appointments are consistent. Times are *displayed* with the browser's own
+  time zone data, so a browser with older data can show a Moroccan
+  appointment one hour off. This needs a decision before launch in Morocco:
+  either the server sends pre-formatted local times, or the frontend ships
+  its own time zone data.
+- **Still open from section 5.4:** a green CI run, the backend image build
+  and the full stack.
+

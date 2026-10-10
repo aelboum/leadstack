@@ -41,7 +41,6 @@
 
 	log {
 		output stdout
-		format json
 		# Tokens travel in the path of /c/, /u/, /f/ and /b/ links and in
 		# invitation links: keep request URIs, referrers and redirect
 		# targets out of access logs.
