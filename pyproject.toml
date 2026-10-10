@@ -1,0 +1,164 @@
+[project]
+name = "leadstack"
+version = "0.1.0"
+description = "LeadStack -- agency CRM and marketing-automation product built on the external SaaS-OS platform package."
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+license = { text = "Proprietary" }
+
+# SaaS-OS is consumed as an external, versioned package (SaaS-OS ADR-0015
+# rules 6-8): a Git dependency pinned to an exact, immutable commit SHA.
+# The URL carries no credentials -- local development authenticates through
+# the developer's own Git credential helper, CI through a read-only secret
+# injected as Git configuration at runtime (.github/workflows/ci.yml).
+# Changing this pin is a deliberate, reviewed act: docs/adr/0001-saas-os-dependency-pin.md.
+#
+# The remaining entries are the packages LeadStack code imports directly
+# (declare what you import); their bounds match SaaS-OS's own at the pinned
+# commit so the resolver never has to choose between the two.
+dependencies = [
+    "saas-os @ git+https://github.com/aelboum/saas-os.git@b126f1ad0c9cf4173ada15e20b14850d9e600c14",
+    "fastapi>=0.115",
+    "pydantic>=2.0",
+    "alembic>=1.13",
+    "sqlalchemy>=2.0",
+    "arq>=0.26",
+    "redis>=5.0",
+    "uvicorn>=0.30",
+    # International phone parsing/normalization to E.164 (libphonenumber port).
+    # Exact pin: metadata changes every release; upgrades are deliberate.
+    "phonenumbers==9.0.40",
+    # IANA time zone database used for all scheduling (instead of the host
+    # OS copy, see leadstack/__init__.py). Exact pin: rule changes (e.g.
+    # Morocco's Ramadan offsets) are reviewed with the upgrade.
+    "tzdata==2026.5",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+    "pyright>=1.1",
+    "import-linter>=2.0",
+    "httpx>=0.27",
+    "psycopg[binary]>=3.2",
+    "pyyaml>=6.0",
+    "pip-audit>=2.7",
+    # Exact pin: a detect-secrets release can change plugin heuristics and
+    # silently invalidate .secrets.baseline (the same reason SaaS-OS pins it).
+    "detect-secrets==1.5.0",
+]
+
+[project.scripts]
+leadstack-migrate = "leadstack.migrate:main"
+leadstack-worker = "leadstack.worker:main"
+leadstack-admin = "leadstack.admin:main"
+
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+# Required for the pinned Git (direct-reference) SaaS-OS dependency above.
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/leadstack"]
+
+# --- Quality gates ----------------------------------------------------------
+
+[tool.ruff]
+target-version = "py313"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S", "BLE", "RUF"]
+ignore = []
+
+[tool.ruff.lint.per-file-ignores]
+# Tests use assert by design and build throwaway credentials for disposable,
+# test-only database roles.
+"tests/**" = ["S101", "S105", "S106", "S311", "S603", "S607", "S608"]
+"src/leadstack/migrations/**" = ["S608"]
+# SQLAlchemy declares table options as a class-level `__table_args__` literal.
+"src/leadstack/domains/**/*models.py" = ["RUF012"]
+# Natural-language text: typographic apostrophes are intended.
+"src/leadstack/domains/messaging/templates.py" = ["RUF001"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection idiom declares dependencies as defaults.
+extend-immutable-calls = [
+    "fastapi.Depends",
+    "fastapi.Query",
+    "leadstack.routes.workspaces._require",
+    "leadstack.routes.crm._require",
+    "leadstack.routes.crm_activity._require",
+    "leadstack.routes.sales._require",
+    "leadstack.routes.forms._require",
+    "leadstack.routes.automation._require",
+    "leadstack.routes.messaging._require",
+    "leadstack.routes.scheduling._require",
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["leadstack"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.13"
+typeCheckingMode = "standard"
+venvPath = "."
+venv = ".venv"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers -m 'not integration'"
+markers = [
+    "integration: needs a disposable PostgreSQL 16 and Redis (see README.md); excluded by default",
+]
+
+# --- Architecture boundaries (import-linter) ---------------------------------
+#
+# `api` is listed as a root package (not only an external one) so contracts
+# can name its submodules: import-linter only resolves submodules of root
+# packages. Everything else from SaaS-OS and third parties is external.
+
+[tool.importlinter]
+root_packages = ["leadstack", "api"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "LeadStack never imports the SaaS-OS application or server (SaaS-OS ADR-0017)"
+type = "forbidden"
+source_modules = ["leadstack"]
+forbidden_modules = ["api.main", "api.server"]
+
+[[tool.importlinter.contracts]]
+name = "Domains never touch SQLAlchemy or psycopg directly (infra.db is the database chokepoint)"
+type = "forbidden"
+source_modules = ["leadstack.domains"]
+forbidden_modules = ["sqlalchemy", "psycopg", "psycopg2", "asyncpg"]
+# The one reviewed exception: column types infra.db does not export (db_types.py).
+ignore_imports = ["leadstack.db_types -> sqlalchemy"]
+
+[[tool.importlinter.contracts]]
+name = "Domains are independent of HTTP and process entrypoints"
+type = "forbidden"
+source_modules = ["leadstack.domains"]
+forbidden_modules = [
+    "fastapi",
+    "starlette",
+    "api",
+    "leadstack.app",
+    "leadstack.routes",
+    "leadstack.worker",
+    "leadstack.migrate",
+]
+
+[[tool.importlinter.contracts]]
+name = "HTTP routes and jobs never open database connections themselves"
+type = "forbidden"
+source_modules = ["leadstack.routes", "leadstack.jobs"]
+forbidden_modules = ["sqlalchemy", "psycopg", "psycopg2", "asyncpg"]
+ignore_imports = ["leadstack.db_types -> sqlalchemy"]

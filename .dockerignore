@@ -1,0 +1,18 @@
+# Keep build contexts small and free of local state and secrets.
+.git
+.venv
+**/node_modules
+**/.next
+**/__pycache__
+**/*.pyc
+.pytest_cache
+.ruff_cache
+.pyright
+.import_linter_cache
+**/.env
+**/.env.*
+!**/.env.example
+deploy/production.env
+docs
+tests
+*.tsbuildinfo

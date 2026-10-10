@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/
+.import_linter_cache/
+.pyright/
+
+# Local configuration and secrets -- never committed (.env.example is the template)
+.env
+.env.*
+!.env.example
+# Deployment secrets (deploy/production.env.example is the template)
+*.env
+deploy/production.env
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,60 @@
+# LeadStack edge proxy. TLS certificates are obtained automatically for
+# LEADSTACK_DOMAIN (the DNS record must point at this host first).
+{
+	email {$ACME_EMAIL}
+}
+
+{$LEADSTACK_DOMAIN} {
+	encode zstd gzip
+
+	# The API and the SaaS-OS login flow. The client address is passed in
+	# X-Forwarded-For; the API trusts it only from this proxy's address.
+	@backend path /v1/* /auth/*
+	handle @backend {
+		# Public endpoints are capped at 64 KiB by the API; this is a coarse
+		# outer bound for every other request.
+		request_body {
+			max_size 2MB
+		}
+		reverse_proxy api:8000 {
+			header_up X-Forwarded-For {remote_host}
+		}
+	}
+
+	# Health endpoints are for the platform, not the internet.
+	@health path /healthz /readyz
+	handle @health {
+		respond 404
+	}
+
+	handle {
+		reverse_proxy frontend:3000
+	}
+
+	# Also for API and login responses (the frontend sets its own, stricter set).
+	header {
+		-Server
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		?Referrer-Policy "strict-origin-when-cross-origin"
+	}
+
+	log {
+		output stdout
+		format json
+		# Tokens travel in the path of /c/, /u/, /f/ and /b/ links and in
+		# invitation links: keep request URIs, referrers and redirect
+		# targets out of access logs.
+		format filter {
+			wrap json
+			fields {
+				request>uri delete
+				request>headers>Referer delete
+				request>headers>Cookie delete
+				request>headers>Authorization delete
+				resp_headers>Location delete
+				resp_headers>Set-Cookie delete
+			}
+		}
+	}
+}

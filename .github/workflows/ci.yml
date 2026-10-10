@@ -1,0 +1,205 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# SaaS-OS is a private repository consumed as a pinned Git dependency
+# (docs/adr/0001-saas-os-dependency-pin.md). Only the jobs that resolve it
+# (quality, integration, security) receive the credential, as job-level
+# environment; the frontend and deploy jobs run third-party build tooling
+# and never see it. It comes from the SAAS_OS_READ_TOKEN repository secret: a
+# fine-grained token (or GitHub App token) with Contents: read on
+# aelboum/saas-os only. It is injected as process-scoped Git configuration
+# (GIT_CONFIG_*), so it is never written to a file, a committed URL, or the
+# lockfile, and GitHub masks it in logs. Without it, dependency resolution
+# fails -- there is no fallback source.
+env:
+  UV_VERSION: "0.12.3"
+  PYTHON_VERSION: "3.13"
+  UV_PYTHON_DOWNLOADS: never
+
+jobs:
+  quality:
+    name: lint, types, architecture, unit tests
+    runs-on: ubuntu-latest
+    env:
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: url.https://x-access-token:${{ secrets.SAAS_OS_READ_TOKEN }}@github.com/aelboum/saas-os.git.insteadOf
+      GIT_CONFIG_VALUE_0: https://github.com/aelboum/saas-os.git
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Require the SaaS-OS read credential
+        env:
+          SAAS_OS_READ_TOKEN: ${{ secrets.SAAS_OS_READ_TOKEN }}
+        run: |
+          if [ -z "$SAAS_OS_READ_TOKEN" ]; then
+            echo "::error::SAAS_OS_READ_TOKEN is not configured; the pinned SaaS-OS dependency cannot be fetched."
+            exit 1
+          fi
+      - name: Lockfile is current
+        run: uv lock --check
+      - name: Install exactly the locked environment
+        run: uv sync --locked
+      - name: Ruff lint
+        run: uv run --locked ruff check .
+      - name: Ruff format
+        run: uv run --locked ruff format --check .
+      - name: Pyright
+        run: uv run --locked pyright
+      - name: Import contracts
+        run: uv run --locked lint-imports --no-cache
+      - name: Unit tests
+        run: uv run --locked pytest
+
+  integration:
+    name: integration tests (PostgreSQL 16, Redis 7)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: leadstack_ci
+          POSTGRES_PASSWORD: ci-only-placeholder # pragma: allowlist secret
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U leadstack_ci -d postgres"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      # Disposable, CI-only service containers; never a shared or production server.
+      LEADSTACK_TEST_ADMIN_DATABASE_URL: postgresql://leadstack_ci:ci-only-placeholder@127.0.0.1:5432/postgres # pragma: allowlist secret
+      LEADSTACK_TEST_REDIS_URL: redis://127.0.0.1:6379/0
+      LEADSTACK_REQUIRE_INTEGRATION: "1"
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: url.https://x-access-token:${{ secrets.SAAS_OS_READ_TOKEN }}@github.com/aelboum/saas-os.git.insteadOf
+      GIT_CONFIG_VALUE_0: https://github.com/aelboum/saas-os.git
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Install exactly the locked environment
+        run: uv sync --locked
+      - name: Integration tests (migrations, readiness, role guard, worker, log secrecy)
+        run: uv run --locked pytest -m integration -p no:cacheprovider
+
+  frontend:
+    name: frontend (types, lint, tests, build, audit)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+      - name: Install exactly the locked dependencies (no lifecycle scripts)
+        run: npm ci --ignore-scripts
+      - name: Type check
+        run: npm run typecheck
+      - name: Lint
+        run: npx eslint . --max-warnings 0
+      - name: Unit and component tests
+        run: npm test
+      - name: Production build
+        run: npm run build
+        env:
+          NEXT_TELEMETRY_DISABLED: "1"
+      - name: Audit runtime dependencies (blocking)
+        run: npm audit --omit=dev --audit-level=high
+      - name: Audit development tooling (informational, see docs/audits)
+        run: npm audit --audit-level=high || true
+
+  deploy:
+    name: deployment files (compose, edge config, frontend image)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Placeholder settings (no real values)
+        run: |
+          cat > "$RUNNER_TEMP/check.env" <<'EOF'
+          LEADSTACK_VERSION=ci
+          LEADSTACK_DOMAIN=leadstack.example
+          ACME_EMAIL=ops@leadstack.example
+          APP_DB_USER=leadstack_app
+          OIDC_ISSUER_URL=https://id.example
+          OIDC_CLIENT_ID=placeholder
+          LEADSTACK_FORM_TOKEN_SECRET=placeholder-placeholder-placeholder-1
+          LEADSTACK_LINK_SIGNING_SECRET=placeholder-placeholder-placeholder-2
+          EOF
+      - name: Compose file is valid (external and bundled data stores)
+        env:
+          SAAS_OS_READ_TOKEN: unused-for-validation
+        run: |
+          docker compose -f deploy/compose.yaml --env-file "$RUNNER_TEMP/check.env" config --quiet
+          docker compose -f deploy/compose.yaml --env-file "$RUNNER_TEMP/check.env" --profile bundled config --quiet
+      - name: Edge configuration is valid
+        run: >-
+          docker run --rm -e LEADSTACK_DOMAIN=leadstack.example -e ACME_EMAIL=ops@leadstack.example
+          -v "$PWD/deploy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2-alpine
+          caddy validate --config /etc/caddy/Caddyfile
+      - name: Frontend image builds and starts (non-root, read-only)
+        run: |
+          docker build -f deploy/Dockerfile.frontend -t leadstack-frontend:ci .
+          docker run -d --name fe --read-only --tmpfs /tmp --tmpfs /app/.next/cache \
+            --cap-drop ALL --security-opt no-new-privileges:true -p 127.0.0.1:3000:3000 leadstack-frontend:ci
+          for i in $(seq 1 30); do curl -fsS -o /dev/null http://127.0.0.1:3000/ && break; sleep 1; done
+          curl -fsS -o /dev/null http://127.0.0.1:3000/
+          curl -fsSI http://127.0.0.1:3000/c/token | grep -i "referrer-policy: no-referrer"
+          test "$(docker exec fe id -u)" != "0"
+
+  security:
+    name: dependency audit and secret scan
+    runs-on: ubuntu-latest
+    env:
+      GIT_CONFIG_COUNT: "1"
+      GIT_CONFIG_KEY_0: url.https://x-access-token:${{ secrets.SAAS_OS_READ_TOKEN }}@github.com/aelboum/saas-os.git.insteadOf
+      GIT_CONFIG_VALUE_0: https://github.com/aelboum/saas-os.git
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          version: ${{ env.UV_VERSION }}
+      - name: Install exactly the locked environment
+        run: uv sync --locked
+      - name: Dependency vulnerability audit (pip-audit, OSV/PyPI advisories)
+        # Audits every locked third-party package, hash-verified. saas-os is
+        # excluded only because it is not a PyPI package and has no advisory
+        # source; its own dependencies are in the lock and are audited here.
+        run: |
+          uv export --frozen --format requirements-txt --no-emit-project \
+            --no-emit-package saas-os --all-groups -o "$RUNNER_TEMP/audit-requirements.txt"
+          uv run --locked pip-audit -r "$RUNNER_TEMP/audit-requirements.txt" \
+            --require-hashes --disable-pip --progress-spinner off
+      - name: Secret scan (detect-secrets, tracked files)
+        run: git ls-files -z | xargs -0 uv run --locked detect-secrets-hook --baseline .secrets.baseline

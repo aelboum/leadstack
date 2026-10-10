@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1.7
+# LeadStack backend image: API (uvicorn), worker (arq) and the migration and
+# admin commands, all from one image. Built from the repository root:
+#
+#   docker build -f deploy/Dockerfile.backend \
+#     --secret id=saas_os_token,env=SAAS_OS_READ_TOKEN -t leadstack-backend .
+#
+# The pinned SaaS-OS dependency lives in a private repository. Its read-only
+# token is passed as a BuildKit secret: it exists only for the duration of
+# one RUN step and is never written to an image layer, the build cache or
+# the image history. Do not pass it as a build argument.
+
+FROM python:3.13-slim-bookworm AS build
+COPY --from=ghcr.io/astral-sh/uv:0.12.3 /uv /usr/local/bin/uv
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends git ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
+WORKDIR /app
+
+# Dependencies first (cached until the lock changes). --frozen: exactly the
+# committed lock, so the SaaS-OS commit pin cannot drift at build time.
+COPY pyproject.toml uv.lock ./
+RUN --mount=type=secret,id=saas_os_token \
+    --mount=type=cache,target=/root/.cache/uv \
+    GIT_CONFIG_COUNT=1 \
+    GIT_CONFIG_KEY_0="url.https://x-access-token:$(cat /run/secrets/saas_os_token)@github.com/aelboum/saas-os.git.insteadOf" \
+    GIT_CONFIG_VALUE_0="https://github.com/aelboum/saas-os.git" \
+    uv sync --frozen --no-dev --no-install-project
+
+COPY README.md alembic.ini ./
+COPY src ./src
+RUN --mount=type=secret,id=saas_os_token \
+    --mount=type=cache,target=/root/.cache/uv \
+    GIT_CONFIG_COUNT=1 \
+    GIT_CONFIG_KEY_0="url.https://x-access-token:$(cat /run/secrets/saas_os_token)@github.com/aelboum/saas-os.git.insteadOf" \
+    GIT_CONFIG_VALUE_0="https://github.com/aelboum/saas-os.git" \
+    uv sync --frozen --no-dev --no-editable
+
+
+FROM python:3.13-slim-bookworm AS runtime
+RUN groupadd --system --gid 10001 leadstack \
+    && useradd --system --uid 10001 --gid leadstack --home-dir /app --shell /usr/sbin/nologin leadstack
+WORKDIR /app
+COPY --from=build --chown=root:root /app/.venv /app/.venv
+ENV PATH="/app/.venv/bin:$PATH" \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+USER leadstack
+EXPOSE 8000
+
+# Default: the API. --proxy-headers with an explicit allowlist: only the
+# edge proxy's address may set X-Forwarded-For, otherwise every visitor
+# would share the proxy's rate limit or could spoof another address
+# (docs/adr/0005, Phase 6 review M4). FORWARDED_ALLOW_IPS has no default.
+CMD ["sh", "-c", "exec uvicorn --factory leadstack.app:create_app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips \"${FORWARDED_ALLOW_IPS:?set FORWARDED_ALLOW_IPS to the edge proxy address}\" --no-server-header"]

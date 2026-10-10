@@ -1,0 +1,245 @@
+# LeadStack single-host topology (ADR-0009). LeadStack-owned: nothing here is
+# copied from SaaS-OS's deployment files.
+#
+#   edge (Caddy, TLS) --> frontend (Next.js)            [front network]
+#                    \--> api (uvicorn)                 [front + data]
+#                         worker (arq)                 [data + egress]
+#                         migrate (one-shot)                    [data]
+#                         postgres, redis (profile "bundled")   [data]
+#
+# Usage (from the repository root, with deploy/production.env filled in):
+#   export SAAS_OS_READ_TOKEN=...            # build-time only, never stored
+#   docker compose -f deploy/compose.yaml --env-file deploy/production.env build
+#   docker compose -f deploy/compose.yaml --env-file deploy/production.env \
+#     --profile bundled up -d                # omit the profile with external data stores
+#
+# Only the edge publishes ports. The edge and the frontend cannot reach the
+# database or Redis. The identity provider (hosted ZITADEL, decision D8) and
+# the SMTP relay are external services.
+
+name: leadstack
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+x-backend: &backend
+  image: leadstack-backend:${LEADSTACK_VERSION:?set LEADSTACK_VERSION}
+  build:
+    context: ..
+    dockerfile: deploy/Dockerfile.backend
+    secrets:
+      - saas_os_token
+  restart: unless-stopped
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  logging: *logging
+
+x-backend-env: &backend-env
+  ENVIRONMENT: production
+  # SaaS-OS requires TLS to PostgreSQL and Redis in production and refuses to
+  # start otherwise. The bundled postgres/redis services (profile "bundled")
+  # speak plaintext on a private Docker network, so with the defaults (true)
+  # they are REFUSED: the stack fails closed. The operator must make one
+  # explicit choice (docs/operations/deployment.md, decision D14):
+  #   a) external TLS data stores: set DATABASE_URL, MIGRATIONS_DATABASE_URL
+  #      and REDIS_URL (rediss://) in production.env, no "bundled" profile; or
+  #   b) the bundled services with both switches set to false, accepting
+  #      plaintext traffic between containers on this single host.
+  DB_REQUIRE_TLS: ${DB_REQUIRE_TLS:-true}
+  REDIS_REQUIRE_TLS: ${REDIS_REQUIRE_TLS:-true}
+  APP_DB_USER: ${APP_DB_USER:?}
+  DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://${APP_DB_USER}:${APP_DB_PASSWORD:-}@postgres:5432/${POSTGRES_DB:-leadstack}}
+  REDIS_URL: ${REDIS_URL:-redis://:${REDIS_PASSWORD:-}@redis:6379/0}
+  PUBLIC_APP_ORIGIN: https://${LEADSTACK_DOMAIN:?}
+  OIDC_ISSUER_URL: ${OIDC_ISSUER_URL:?}
+  OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:?}
+  # Empty means a public client with PKCE (SaaS-OS treats empty as unset).
+  OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:-}
+  LEADSTACK_FORM_TOKEN_SECRET: ${LEADSTACK_FORM_TOKEN_SECRET:?}
+  LEADSTACK_LINK_SIGNING_SECRET: ${LEADSTACK_LINK_SIGNING_SECRET:?}
+  SMTP_HOST: ${SMTP_HOST:-}
+  SMTP_PORT: ${SMTP_PORT:-587}
+  SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
+  SMTP_USERNAME: ${SMTP_USERNAME:-}
+  SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+  EMAIL_DEFAULT_SENDER: ${EMAIL_DEFAULT_SENDER:-}
+
+services:
+  postgres:
+    profiles: [bundled]
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-}
+      POSTGRES_DB: ${POSTGRES_DB:-leadstack}
+      # Read by deploy/postgres/10-roles.sh on first initialisation only.
+      OWNER_DB_USER: ${OWNER_DB_USER:-leadstack_owner}
+      OWNER_DB_PASSWORD: ${OWNER_DB_PASSWORD:-}
+      APP_DB_USER: ${APP_DB_USER:?}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/10-roles.sh:/docker-entrypoint-initdb.d/10-roles.sh:ro
+    healthcheck:
+      # Over TCP: the temporary server that runs the init scripts listens on
+      # the Unix socket only, so this turns healthy only after the roles exist.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U postgres -d $$POSTGRES_DB"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    logging: *logging
+    networks: [data]
+
+  redis:
+    profiles: [bundled]
+    image: redis:7-alpine
+    restart: unless-stopped
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      REDISCLI_AUTH: ${REDIS_PASSWORD:-}
+    # Jobs are deserialized by the worker: Redis requires a password even on
+    # the private network. Queued jobs and rate-limit counters must survive
+    # a restart (append-only file).
+    command:
+      - sh
+      - -c
+      - 'test -n "$$REDIS_PASSWORD" || { echo "REDIS_PASSWORD is required"; exit 1; }; exec redis-server --appendonly yes --appendfsync everysec --requirepass "$$REDIS_PASSWORD"'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    logging: *logging
+    networks: [data]
+
+  migrate:
+    <<: *backend
+    restart: "no"
+    # The only service that receives the schema-owner credentials.
+    environment:
+      <<: *backend-env
+      MIGRATIONS_DATABASE_URL: ${MIGRATIONS_DATABASE_URL:-postgresql+psycopg://${OWNER_DB_USER:-leadstack_owner}:${OWNER_DB_PASSWORD:-}@postgres:5432/${POSTGRES_DB:-leadstack}}
+    command: ["leadstack-migrate", "upgrade"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+        required: false
+    networks: [data]
+
+  api:
+    <<: *backend
+    environment:
+      <<: *backend-env
+      # Only the edge proxy may set X-Forwarded-For (its fixed address below).
+      FORWARDED_ALLOW_IPS: 172.28.0.10
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+        required: false
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=3).status == 200 else 1)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks: [front, data]
+
+  worker:
+    <<: *backend
+    environment:
+      <<: *backend-env
+    command: ["leadstack-worker"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+        required: false
+    healthcheck:
+      test: ["CMD", "leadstack-worker", "--check"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+    # `data` has no route out; the worker sends email through `egress`.
+    networks: [data, egress]
+
+  frontend:
+    image: leadstack-frontend:${LEADSTACK_VERSION:?}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.frontend
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /app/.next/cache
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/').then(r => process.exit(r.status < 500 ? 0 : 1), () => process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    logging: *logging
+    networks: [front]
+
+  edge:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      LEADSTACK_DOMAIN: ${LEADSTACK_DOMAIN:?}
+      ACME_EMAIL: ${ACME_EMAIL:?}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data
+      - caddy-config:/config
+    depends_on:
+      api:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    logging: *logging
+    networks:
+      front:
+        ipv4_address: 172.28.0.10
+
+networks:
+  # Edge, frontend and API. If this subnet collides with an existing network
+  # on the host, change it here and in FORWARDED_ALLOW_IPS together.
+  front:
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+  # API, worker, migrations and the data stores. No route to the internet.
+  data:
+    internal: true
+  # Outbound only (SMTP relay) for the worker; nothing else is attached.
+  egress: {}
+
+volumes:
+  postgres-data:
+  redis-data:
+  caddy-data:
+  caddy-config:
+
+secrets:
+  saas_os_token:
+    environment: SAAS_OS_READ_TOKEN
